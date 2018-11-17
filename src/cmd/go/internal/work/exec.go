@@ -1754,13 +1754,33 @@ func (b *Builder) Showcmd(dir string, format string, args ...interface{}) {
 // printing to b.Print.
 //
 func (b *Builder) showOutput(a *Action, dir, desc, out string) {
-	prefix := "# " + desc
-	suffix := "\n" + out
-	if reldir := base.ShortPath(dir); reldir != dir {
-		suffix = strings.ReplaceAll(suffix, " "+dir, " "+reldir)
-		suffix = strings.ReplaceAll(suffix, "\n"+dir, "\n"+reldir)
+	style := os.Getenv("GO_EXEC_OUTPUT_STYLE")
+	prefix := ""
+	suffix := ""
+	switch style {
+	case "", "go":
+		prefix = "# " + desc
+		suffix = "\n" + out
+		if reldir := base.ShortPath(dir); reldir != dir {
+			suffix = strings.ReplaceAll(suffix, " "+dir, " "+reldir)
+			suffix = strings.ReplaceAll(suffix, "\n"+dir, "\n"+reldir)
+			suffix = strings.ReplaceAll(suffix, " "+b.WorkDir, " $WORK")
+		}
+	case "path", "raw", "full":
+		suffix = out
+	case "gmake":
+		prefix = "Entering directory `" + dir + "'"
+		suffix = "\n" + out
+		if reldir := base.ShortPath(dir); reldir != dir {
+			suffix = strings.ReplaceAll(suffix, " "+dir, " "+reldir)
+			suffix = strings.ReplaceAll(suffix, "\n"+dir, "\n"+reldir)
+		}
+		suffix += "Leaving directory `" + dir + "'\n"
+	default:
+		prefix = "# GO_EXEC_OUTPUT_STYLE=" + style + "\n# dir=" + dir + "\n# reldir=" +
+			base.ShortPath(dir) + "\n# WorkDir=" + b.WorkDir + "\n# desc=" + desc + "\n"
+		suffix = out
 	}
-	suffix = strings.ReplaceAll(suffix, " "+b.WorkDir, " $WORK")
 
 	if a != nil && a.output != nil {
 		a.output = append(a.output, prefix...)
