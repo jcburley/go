@@ -21,6 +21,7 @@ export GOPATH
 unset CDPATH	# in case user has it set
 unset GOBIN     # Issue 14340
 unset GOFLAGS
+export GO_EXEC_OUTPUT_STYLE=go	# Tests expect original Go-style reporting by 'generate' et al
 
 export GOHOSTOS
 export CC
