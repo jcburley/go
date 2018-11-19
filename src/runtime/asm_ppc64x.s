@@ -355,9 +355,6 @@ TEXT runtime·morestack_noctxt(SB),NOSPLIT|NOFRAME,$0-0
 	BR	(CTR)
 // Note: can't just "BR NAME(SB)" - bad inlining results.
 
-TEXT reflect·call(SB), NOSPLIT, $0-0
-	BR	·reflectcall(SB)
-
 TEXT ·reflectcall(SB), NOSPLIT|NOFRAME, $0-32
 	MOVWZ argsize+24(FP), R3
 	DISPATCH(runtime·call32, 32)
@@ -519,9 +516,6 @@ again:
 // the BL deferreturn and jmpdefer rewinds to that.
 TEXT runtime·jmpdefer(SB), NOSPLIT|NOFRAME, $0-16
 	MOVD	0(R1), R31
-#ifdef GOOS_aix
-	MOVD	16(R31), R31	// caller LR is on the previous stack frame on AIX
-#endif
 	SUB     $8, R31
 	MOVD	R31, LR
 

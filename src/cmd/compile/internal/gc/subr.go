@@ -28,9 +28,17 @@ type Error struct {
 
 var errors []Error
 
+// largeStack is info about a function whose stack frame is too large (rare).
+type largeStack struct {
+	locals int64
+	args   int64
+	callee int64
+	pos    src.XPos
+}
+
 var (
 	largeStackFramesMu sync.Mutex // protects largeStackFrames
-	largeStackFrames   []src.XPos // positions of functions whose stack frames are too large (rare)
+	largeStackFrames   []largeStack
 )
 
 func errorexit() {
@@ -234,7 +242,7 @@ func lookupN(prefix string, n int) *types.Sym {
 // to help with debugging.
 // It should begin with "." to avoid conflicts with
 // user labels.
-func autolabel(prefix string) *Node {
+func autolabel(prefix string) *types.Sym {
 	if prefix[0] != '.' {
 		Fatalf("autolabel prefix must start with '.', have %q", prefix)
 	}
@@ -244,7 +252,7 @@ func autolabel(prefix string) *Node {
 	}
 	n := fn.Func.Label
 	fn.Func.Label++
-	return newname(lookupN(prefix, int(n)))
+	return lookupN(prefix, int(n))
 }
 
 func restrictlookup(name string, pkg *types.Pkg) *types.Sym {
@@ -688,11 +696,19 @@ func convertop(src *types.Type, dst *types.Type, why *string) Op {
 	}
 
 	// Conversions from regular to go:notinheap are not allowed
-	// (unless it's unsafe.Pointer). This is a runtime-specific
-	// rule.
+	// (unless it's unsafe.Pointer). These are runtime-specific
+	// rules.
+	// (a) Disallow (*T) to (*U) where T is go:notinheap but U isn't.
 	if src.IsPtr() && dst.IsPtr() && dst.Elem().NotInHeap() && !src.Elem().NotInHeap() {
 		if why != nil {
 			*why = fmt.Sprintf(":\n\t%v is go:notinheap, but %v is not", dst.Elem(), src.Elem())
+		}
+		return 0
+	}
+	// (b) Disallow string to []T where T is go:notinheap.
+	if src.IsString() && dst.IsSlice() && dst.Elem().NotInHeap() && (dst.Elem().Etype == types.Bytetype.Etype || dst.Elem().Etype == types.Runetype.Etype) {
+		if why != nil {
+			*why = fmt.Sprintf(":\n\t%v is go:notinheap", dst.Elem())
 		}
 		return 0
 	}
@@ -751,10 +767,10 @@ func convertop(src *types.Type, dst *types.Type, why *string) Op {
 
 	if src.IsSlice() && dst.IsString() {
 		if src.Elem().Etype == types.Bytetype.Etype {
-			return OARRAYBYTESTR
+			return OBYTES2STR
 		}
 		if src.Elem().Etype == types.Runetype.Etype {
-			return OARRAYRUNESTR
+			return ORUNES2STR
 		}
 	}
 
@@ -762,10 +778,10 @@ func convertop(src *types.Type, dst *types.Type, why *string) Op {
 	// String to slice.
 	if src.IsString() && dst.IsSlice() {
 		if dst.Elem().Etype == types.Bytetype.Etype {
-			return OSTRARRAYBYTE
+			return OSTR2BYTES
 		}
 		if dst.Elem().Etype == types.Runetype.Etype {
-			return OSTRARRAYRUNE
+			return OSTR2RUNES
 		}
 	}
 
@@ -954,36 +970,6 @@ func typehash(t *types.Type) uint32 {
 	return binary.LittleEndian.Uint32(h[:4])
 }
 
-func frame(context int) {
-	if context != 0 {
-		fmt.Printf("--- external frame ---\n")
-		for _, n := range externdcl {
-			printframenode(n)
-		}
-		return
-	}
-
-	if Curfn != nil {
-		fmt.Printf("--- %v frame ---\n", Curfn.Func.Nname.Sym)
-		for _, ln := range Curfn.Func.Dcl {
-			printframenode(ln)
-		}
-	}
-}
-
-func printframenode(n *Node) {
-	w := int64(-1)
-	if n.Type != nil {
-		w = n.Type.Width
-	}
-	switch n.Op {
-	case ONAME:
-		fmt.Printf("%v %v G%d %v width=%d\n", n.Op, n.Sym, n.Name.Vargen, n.Type, w)
-	case OTYPE:
-		fmt.Printf("%v %v width=%d\n", n.Op, n.Type, w)
-	}
-}
-
 // updateHasCall checks whether expression n contains any function
 // calls and sets the n.HasCall flag if so.
 func updateHasCall(n *Node) {
@@ -1013,14 +999,14 @@ func calcHasCall(n *Node) bool {
 			return true
 		}
 	case OINDEX, OSLICE, OSLICEARR, OSLICE3, OSLICE3ARR, OSLICESTR,
-		OIND, ODOTPTR, ODOTTYPE, ODIV, OMOD:
+		ODEREF, ODOTPTR, ODOTTYPE, ODIV, OMOD:
 		// These ops might panic, make sure they are done
 		// before we start marshaling args for a call. See issue 16760.
 		return true
 
 	// When using soft-float, these ops might be rewritten to function calls
 	// so we ensure they are evaluated first.
-	case OADD, OSUB, OMINUS:
+	case OADD, OSUB, ONEG, OMUL:
 		if thearch.SoftFloat && (isFloat[n.Type.Etype] || isComplex[n.Type.Etype]) {
 			return true
 		}
@@ -1130,11 +1116,11 @@ func safeexpr(n *Node, init *Nodes) *Node {
 		}
 		r := n.copy()
 		r.Left = l
-		r = typecheck(r, Erv)
+		r = typecheck(r, ctxExpr)
 		r = walkexpr(r, init)
 		return r
 
-	case ODOTPTR, OIND:
+	case ODOTPTR, ODEREF:
 		l := safeexpr(n.Left, init)
 		if l == n.Left {
 			return n
@@ -1172,7 +1158,7 @@ func safeexpr(n *Node, init *Nodes) *Node {
 func copyexpr(n *Node, t *types.Type, init *Nodes) *Node {
 	l := temp(t)
 	a := nod(OAS, l, n)
-	a = typecheck(a, Etop)
+	a = typecheck(a, ctxStmt)
 	a = walkexpr(a, init)
 	init.Append(a)
 	return l
@@ -1322,7 +1308,7 @@ func dotpath(s *types.Sym, t *types.Type, save **types.Field, ignorecase bool) (
 // will give shortest unique addressing.
 // modify the tree with missing type names.
 func adddot(n *Node) *Node {
-	n.Left = typecheck(n.Left, Etype|Erv)
+	n.Left = typecheck(n.Left, Etype|ctxExpr)
 	if n.Left.Diag() {
 		n.SetDiag(true)
 	}
@@ -1492,7 +1478,7 @@ func structargs(tl *types.Type, mustname bool) []*Node {
 		}
 		a := symfield(s, t.Type)
 		a.Pos = t.Pos
-		a.SetIsddd(t.Isddd())
+		a.SetIsDDD(t.IsDDD())
 		args = append(args, a)
 	}
 
@@ -1585,7 +1571,7 @@ func genwrapper(rcvr *types.Type, method *types.Field, newnam *types.Sym) {
 		fn.Func.SetWrapper(true) // ignore frame for panic+recover matching
 		call := nod(OCALL, dot, nil)
 		call.List.Set(paramNnames(tfn.Type))
-		call.SetIsddd(tfn.Type.IsVariadic())
+		call.SetIsDDD(tfn.Type.IsVariadic())
 		if method.Type.NumResults() > 0 {
 			n := nod(ORETURN, nil, nil)
 			n.List.Set1(call)
@@ -1603,10 +1589,10 @@ func genwrapper(rcvr *types.Type, method *types.Field, newnam *types.Sym) {
 		testdclstack()
 	}
 
-	fn = typecheck(fn, Etop)
+	fn = typecheck(fn, ctxStmt)
 
 	Curfn = fn
-	typecheckslice(fn.Nbody.Slice(), Etop)
+	typecheckslice(fn.Nbody.Slice(), ctxStmt)
 
 	// Inline calls within (*T).M wrappers. This is safe because we only
 	// generate those wrappers within the same compilation unit as (T).M.
@@ -1633,6 +1619,7 @@ func hashmem(t *types.Type) *Node {
 
 	n := newname(sym)
 	n.SetClass(PFUNC)
+	n.Sym.SetFunc(true)
 	n.Type = functype(nil, []*Node{
 		anonfield(types.NewPtr(t)),
 		anonfield(types.Types[TUINTPTR]),
@@ -1865,7 +1852,7 @@ func checknil(x *Node, init *Nodes) {
 	x = walkexpr(x, nil) // caller has not done this yet
 	if x.Type.IsInterface() {
 		x = nod(OITAB, x, nil)
-		x = typecheck(x, Erv)
+		x = typecheck(x, ctxExpr)
 	}
 
 	n := nod(OCHECKNIL, x, nil)
@@ -1923,7 +1910,7 @@ func ifaceData(n *Node, t *types.Type) *Node {
 	ptr.Type = types.NewPtr(t)
 	ptr.SetBounded(true)
 	ptr.SetTypecheck(1)
-	ind := nod(OIND, ptr, nil)
+	ind := nod(ODEREF, ptr, nil)
 	ind.Type = t
 	ind.SetTypecheck(1)
 	return ind
